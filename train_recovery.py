@@ -43,15 +43,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-checkpoints", type=Path, required=True)
     parser.add_argument("--data", type=Path, default=None)
     parser.add_argument("--recovery-epochs", type=int, default=30)
-    parser.add_argument("--adapter-epochs", type=int, default=5)
     parser.add_argument("--recovery-learning-rate", type=float, default=0.001)
-    parser.add_argument("--adapter-learning-rate", type=float, default=0.0003)
-    parser.add_argument("--adapter-distill-weight", type=float, default=1.0)
     parser.add_argument("--train-sample-step", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--recovery-hidden-dim", type=int, default=64)
     parser.add_argument("--recovery-heads", type=int, default=4)
-    parser.add_argument("--adapter-hidden-dim", type=int, default=32)
     parser.add_argument("--short-kernel", type=int, default=9)
     parser.add_argument("--long-kernel", type=int, default=21)
     parser.add_argument("--trend-loss-weight", type=float, default=0.2)
@@ -273,128 +269,17 @@ def train_recovery(
 def calibrate_thresholds(model, loader, quantile: float, device: torch.device):
     relation_parts: list[np.ndarray] = []
     point_parts: list[np.ndarray] = []
-    mode_parts: list[np.ndarray] = []
     model.eval()
     for windows, _ in loader:
         windows = windows.to(device, non_blocking=True)
         mean, scale, _ = model.recover(windows)
         relation, point = model.raw_fault_scores(windows, mean, scale)
-        repaired = model.repaired_windows(windows, mean)
-        repaired_logits, _ = model.fault_logits(repaired)
         relation_parts.append(relation.cpu().numpy())
         point_parts.append(point.cpu().numpy())
-        mode_parts.append(repaired_logits.argmax(dim=-1).cpu().numpy())
-    relation = np.concatenate(relation_parts)
-    point = np.concatenate(point_parts)
-    mode = np.concatenate(mode_parts)
-    global_relation = float(np.quantile(relation, quantile))
-    global_point = float(np.quantile(point, quantile))
-    relation_threshold = np.empty(3, dtype=np.float32)
-    point_threshold = np.empty(3, dtype=np.float32)
-    for class_index in range(3):
-        selected = mode == class_index
-        if int(selected.sum()) < 100:
-            relation_threshold[class_index] = global_relation
-            point_threshold[class_index] = global_point
-        else:
-            relation_threshold[class_index] = np.quantile(
-                relation[selected], quantile
-            )
-            point_threshold[class_index] = np.quantile(point[selected], quantile)
+    relation_threshold = float(np.quantile(np.concatenate(relation_parts), quantile))
+    point_threshold = float(np.quantile(np.concatenate(point_parts), quantile))
     model.set_thresholds(relation_threshold, point_threshold)
-    return relation_threshold.tolist(), point_threshold.tolist()
-
-
-@torch.inference_mode()
-def forced_validation_metrics(model, loader, device: torch.device):
-    actual_parts: list[np.ndarray] = []
-    predicted_parts: list[np.ndarray] = []
-    model.eval()
-    for windows, labels in loader:
-        logits = model(
-            windows.to(device, non_blocking=True), force_fault=True
-        )
-        actual_parts.append(labels.numpy())
-        predicted_parts.append(logits.argmax(dim=-1).cpu().numpy())
-    return classification_metrics(
-        np.concatenate(actual_parts), np.concatenate(predicted_parts)
-    )
-
-
-def train_adapter(
-    model,
-    train_loader,
-    validation_loader,
-    epochs: int,
-    learning_rate: float,
-    distill_weight: float,
-    class_weights: np.ndarray,
-    device: torch.device,
-    run_number: int,
-) -> list[dict[str, float]]:
-    optimizer = torch.optim.AdamW(
-        model.adapter_parameters(), lr=learning_rate, weight_decay=1e-4
-    )
-    weight = torch.as_tensor(class_weights, dtype=torch.float32, device=device)
-    criterion = nn.CrossEntropyLoss(weight=weight)
-    best_state: dict[str, Tensor] | None = None
-    best_f1 = -np.inf
-    history: list[dict[str, float]] = []
-    temperature = 2.0
-    for epoch in range(1, epochs + 1):
-        model.adapter.train()
-        model.base.eval()
-        model.recovery.eval()
-        total_loss = 0.0
-        count = 0
-        for windows, labels in train_loader:
-            windows = windows.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-            with torch.no_grad():
-                teacher_logits = model.base(windows)
-                mean, _, _ = model.recover(windows)
-                repaired = model.repaired_windows(windows, mean)
-                encoded = model.base.encoder(repaired)
-                repaired_base_logits = model.base.classifier(encoded)
-            logits = repaired_base_logits + model.adapter(encoded.detach())
-            classification = criterion(logits, labels)
-            distillation = nn.functional.kl_div(
-                nn.functional.log_softmax(logits / temperature, dim=-1),
-                nn.functional.softmax(teacher_logits / temperature, dim=-1),
-                reduction="batchmean",
-            ) * (temperature**2)
-            loss = classification + distill_weight * distillation
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.adapter.parameters(), 5.0)
-            optimizer.step()
-            total_loss += float(loss.detach()) * len(windows)
-            count += len(windows)
-        metrics = forced_validation_metrics(model, validation_loader, device)
-        mean_loss = total_loss / max(count, 1)
-        validation_f1 = float(metrics["macro_f1"])
-        history.append(
-            {
-                "epoch": epoch,
-                "train_loss": mean_loss,
-                "validation_accuracy": float(metrics["accuracy"]),
-                "validation_macro_f1": validation_f1,
-            }
-        )
-        if validation_f1 > best_f1:
-            best_f1 = validation_f1
-            best_state = copy.deepcopy(model.adapter.state_dict())
-        print(
-            f"[run {run_number:02d}] adapter {epoch:02d}/{epochs} "
-            f"loss={mean_loss:.6f} val_accuracy={metrics['accuracy']:.4f} "
-            f"val_macro_F1={validation_f1:.4f}",
-            flush=True,
-        )
-    if best_state is None:
-        raise RuntimeError("adapter training produced no checkpoint")
-    model.adapter.load_state_dict(best_state)
-    model.adapter.eval()
-    return history
+    return relation_threshold, point_threshold
 
 
 @torch.inference_mode()
@@ -498,8 +383,8 @@ def main() -> None:
     args = parse_args()
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but unavailable")
-    if args.recovery_epochs < 1 or args.adapter_epochs < 1:
-        raise ValueError("recovery and adapter epochs must be positive")
+    if args.recovery_epochs < 1:
+        raise ValueError("recovery epochs must be positive")
     if not 0.5 < args.threshold_quantile < 1.0:
         raise ValueError("threshold quantile must be between 0.5 and 1")
     checkpoints = find_checkpoints(args.base_checkpoints)
@@ -530,7 +415,6 @@ def main() -> None:
             recovery_heads=args.recovery_heads,
             short_kernel=args.short_kernel,
             long_kernel=args.long_kernel,
-            adapter_hidden_dim=args.adapter_hidden_dim,
         ).to(device)
         train_subset = Subset(
             bundle.train, range(0, len(bundle.train), args.train_sample_step)
@@ -565,17 +449,6 @@ def main() -> None:
             args.recovery_epochs,
             args.recovery_learning_rate,
             args.trend_loss_weight,
-            device,
-            run_number,
-        )
-        adapter_history = train_adapter(
-            model,
-            train_loader,
-            validation_loader,
-            args.adapter_epochs,
-            args.adapter_learning_rate,
-            args.adapter_distill_weight,
-            bundle.class_weights,
             device,
             run_number,
         )
@@ -632,7 +505,6 @@ def main() -> None:
         run_dir = args.output / f"run_{run_number:02d}"
         run_dir.mkdir(parents=True, exist_ok=True)
         recovery_parameters = sum(p.numel() for p in model.recovery.parameters())
-        adapter_parameters = sum(p.numel() for p in model.adapter.parameters())
         source_names = [FEATURE_COLUMNS[i] for i in source_indices]
         attention_mean = noisy_attention.mean(axis=0)
         attention_ranking = [
@@ -662,9 +534,7 @@ def main() -> None:
             "clean_fault_ratio_mean": float(clean_ratio.mean()),
             "noisy_fault_ratio_mean": float(noisy_ratio.mean()),
             "recovery_parameter_count": recovery_parameters,
-            "adapter_parameter_count": adapter_parameters,
             "recovery_history": recovery_history,
-            "adapter_history": adapter_history,
             "attention_ranking": attention_ranking,
             **conditions,
         }
@@ -716,7 +586,8 @@ def main() -> None:
         )
         print(
             f"  fault rate clean/noisy={100*clean_fault.mean():.2f}%/"
-            f"{100*noisy_fault.mean():.2f}% thresholds are mode-conditional",
+            f"{100*noisy_fault.mean():.2f}% "
+            f"(relation threshold={relation_threshold:.3f}, point threshold={point_threshold:.4f})",
             flush=True,
         )
         print(
@@ -736,7 +607,7 @@ def main() -> None:
     )
     summaries = {name: summarize(runs, name) for name in condition_names}
     report = {
-        "experiment": "frozen no-graph classifier plus clean-only VOC recovery graph and adapter",
+        "experiment": "frozen no-graph classifier plus clean-only VOC recovery graph",
         "noise_used_during_training": False,
         "test_fault": {
             "feature": "VOC_Room_RAW",

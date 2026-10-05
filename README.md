@@ -3,8 +3,7 @@
 Clean-data-only indoor-fire classification with selective VOC sensor recovery.
 The base classifier is frozen before a directed recovery graph learns to
 reconstruct `VOC_Room_RAW` from the other 13 sensors. At inference time, clean
-windows bypass recovery, while detected VOC faults use the reconstructed trend
-and a compact residual adapter.
+windows bypass recovery, while detected VOC faults use the reconstructed trend.
 
 ## Project layout
 
@@ -13,7 +12,8 @@ data/                       Processed Indoor Fire Dataset
 voc_fire/                   Shared data, model, recovery, and metric code
 train_base.py               Train the three-class base classifier
 diagnose_recovery.py        Measure clean-only VOC reconstruction quality
-train_recovery.py           Train and evaluate the recovery adapter
+train_recovery.py           Train and evaluate the VOC recovery graph
+ablate_recovery.py          Ablate detection signals and the sensor embedding
 evaluate_noise.py           Stress-test base checkpoints with VOC faults
 requirements.txt            Runtime dependencies
 ```
@@ -56,13 +56,13 @@ python -m venv .venv
   --device cuda --output ".\results\voc_recovery_diagnostic"
 ```
 
-3. Train and evaluate the clean-only recovery adapter.
+3. Train and evaluate the clean-only VOC recovery graph.
 
 ```powershell
 & ".\.venv\Scripts\python.exe" ".\train_recovery.py" `
   --base-checkpoints ".\results\base_mlp_3seeds" `
   --noise-level 0.20 --device cuda `
-  --output ".\results\voc_recovery_adapter_3seeds"
+  --output ".\results\voc_recovery_3seeds"
 ```
 
 4. To evaluate a frozen base model without recovery, inject a test-only fault.
